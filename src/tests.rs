@@ -603,6 +603,10 @@ mod connection {
         read_chunk: usize,
         read_delay: Duration,
         fail_next_read: AtomicBool,
+        /// Armed with the connection's abort flag. The next read sets it and
+        /// then fails, which is what a cancel looks like from inside
+        /// `read_some`: the flag and the closed link arrive together.
+        abort_during_read: Mutex<Option<Arc<AtomicBool>>>,
         closed: AtomicBool,
     }
 
@@ -615,6 +619,7 @@ mod connection {
                 read_chunk: usize::MAX,
                 read_delay: Duration::ZERO,
                 fail_next_read: AtomicBool::new(false),
+                abort_during_read: Mutex::new(None),
                 closed: AtomicBool::new(false),
             })
         }
@@ -627,6 +632,7 @@ mod connection {
                 read_chunk,
                 read_delay: Duration::ZERO,
                 fail_next_read: AtomicBool::new(false),
+                abort_during_read: Mutex::new(None),
                 closed: AtomicBool::new(false),
             };
             mock.read_chunk = read_chunk;
@@ -641,8 +647,14 @@ mod connection {
                 read_chunk: usize::MAX,
                 read_delay,
                 fail_next_read: AtomicBool::new(false),
+                abort_during_read: Mutex::new(None),
                 closed: AtomicBool::new(false),
             })
+        }
+
+        /// Make the next read behave like one that a cancel interrupted.
+        fn abort_during_read(&self, aborted: &Arc<AtomicBool>) {
+            *self.abort_during_read.lock().unwrap() = Some(Arc::clone(aborted));
         }
 
         pub(super) fn write_count(&self) -> usize {
@@ -681,6 +693,10 @@ mod connection {
         }
 
         async fn read_some(&self, timeout: Duration) -> Result<Vec<u8>, JadeError> {
+            if let Some(aborted) = self.abort_during_read.lock().unwrap().take() {
+                aborted.store(true, Ordering::SeqCst);
+                return Err(JadeError::DeviceDisconnected);
+            }
             if self.fail_next_read.swap(false, Ordering::SeqCst) {
                 return Err(JadeError::DeviceDisconnected);
             }
@@ -1037,6 +1053,24 @@ mod connection {
 
         assert_eq!(error, JadeError::UserCancelled);
         assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn a_cancel_noticed_as_a_transport_error_is_still_a_cancellation() {
+        // `cancel` sets the abort flag and closes the link, so a loop parked
+        // inside `read_some` sees only the close. That is the common case on
+        // Bluetooth, where a read blocks for its timeout, and reporting it as a
+        // disconnection would put an error on a screen the user just dismissed.
+        let mock = MockTransport::new(vec![Box::new(|_: &SeenRequest| Vec::new())]);
+        let (mut connection, aborted) = connect(Arc::clone(&mock));
+        mock.abort_during_read(&aborted);
+
+        let error = connection
+            .exchange("sign_psbt", Option::<()>::None, Duration::from_secs(600))
+            .await
+            .unwrap_err();
+
+        assert_eq!(error, JadeError::UserCancelled);
     }
 
     #[tokio::test]

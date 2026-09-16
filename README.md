@@ -171,6 +171,11 @@ tokio::spawn(async move {
 # }
 ```
 
+The operation in flight fails with `JadeError::UserCancelled`. `cancel` both sets
+an abort flag and closes the link, and which one the request notices first is a
+race, so the flag wins whenever it is set: a cancelled operation never reports a
+disconnection the user did not experience.
+
 ## Unlocking
 
 A PIN protected Jade is unlocked through a blind pinserver. The exchange is end
