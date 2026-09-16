@@ -105,6 +105,9 @@ impl std::fmt::Debug for CancelHandle {
 
 impl CancelHandle {
     /// Signal the abort and close the link.
+    ///
+    /// The operation in flight fails with `JadeError::UserCancelled`, whether it
+    /// notices the flag or the closed link first.
     pub async fn cancel(&self) -> Result<(), JadeError> {
         self.aborted.store(true, Ordering::SeqCst);
         self.transport.close().await
@@ -162,6 +165,25 @@ impl JadeConnection {
         Ok(())
     }
 
+    /// Report a deliberate abort as a cancellation, whatever the link did.
+    ///
+    /// `CancelHandle::cancel` sets the flag and closes the transport, so the two
+    /// reach this connection by different routes and either can be noticed
+    /// first. The loop in `await_reply` reads the flag once per iteration, but a
+    /// cancel landing while it is parked inside `read_some`, which is where a
+    /// Bluetooth transport spends most of a confirmation because it honours the
+    /// read timeout, surfaces only as a transport error: the read returns the
+    /// close and the flag is never re-read. Prefer the flag, so a cancel button
+    /// always reports `UserCancelled` rather than a disconnection the user did
+    /// not experience.
+    fn abort_or(&self, error: JadeError) -> JadeError {
+        if self.aborted.load(Ordering::SeqCst) {
+            JadeError::UserCancelled
+        } else {
+            error
+        }
+    }
+
     /// Mark the stream unusable and drop anything half read.
     fn poison(&mut self) {
         self.poisoned = true;
@@ -203,7 +225,7 @@ impl JadeConnection {
             Ok(Ok(())) => Ok(deadline.saturating_duration_since(Instant::now())),
             Ok(Err(error)) => {
                 self.poison();
-                Err(error)
+                Err(self.abort_or(error))
             }
             Err(_) => {
                 self.poison();
@@ -279,7 +301,7 @@ impl JadeConnection {
                 Ok(chunk) => chunk,
                 Err(error) => {
                     self.poison();
-                    return Err(error);
+                    return Err(self.abort_or(error));
                 }
             };
 
